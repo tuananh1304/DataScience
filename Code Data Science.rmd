@@ -1,0 +1,623 @@
+---
+title: "Data Science"
+author: "Nguyen Tuan Anh"
+date: "2023-01-04"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+---
+Library
+```{r}
+library(readr)
+library(janitor)
+library(skimr)
+library(ggplot2)
+library(plotly)
+library(dplyr)
+library(ggcorrplot)
+library(rpart.plot)
+library(tidyverse)
+library(tidymodels)
+library(pdp)
+library(corrplot)
+library(rpart)
+library(caret)
+library(xgboost)
+library(gbm)
+library(gridExtra)
+library(randomForest)
+```
+
+Input data
+```{r}
+datraw <- read.csv("D:/ISFA7/ISFA-Lyon-M2/Data Science/project/dataTrain_28.csv")
+testraw <- read.csv("D:/ISFA7/ISFA-Lyon-M2/Data Science/project/test.csv")
+```
+
+
+```{r}
+skim(datraw)
+```
+
+Correlation
+```{r}
+datraw %>% 
+  select_if(is.numeric) %>% 
+  select(-c(material,id)) %>% 
+  cor() %>% 
+  ggcorrplot( hc.order = TRUE, type = "lower", 
+              outline.col = "white",
+              ggtheme = ggplot2::theme_gray,
+              colors = c("#6D9EC1", "white", "#E46726"),
+              lab = TRUE)
+```
+
+Function for transforming data for xgboost
+```{r}
+prepro <- function(datx){
+  datx$gender <- as.numeric(factor(datx$gender))
+  datx$carType <- as.numeric(factor(datx$carType))
+  datx$carCategory <- as.numeric(factor(datx$carCategory))
+  datx$occupation <- as.numeric(factor(datx$occupation))
+  datx$age <- pmin(datx$age, 80)
+  datx$subRegion <- as.numeric(factor(datx$subRegion))
+  datx$region <- as.numeric(factor(datx$region))
+  datx$cityDensity <- round(log(datx$cityDensity),2)
+  datx$carGroup <- as.numeric(factor(datx$carGroup))
+  datx$material <- as.numeric(factor(datx$material))
+  datx
+}
+```
+
+Add frequency columns for modeling frequency of claim
+```{r}
+#Add columns for frequency and severity modelling
+nfold <- 5
+datraw <- datraw %>% mutate( freq = claimNumber / exposure )
+datraw <- datraw %>% mutate (fold = paste0("data", rep(1:nfold, length = nrow(datraw)))) 
+datraw$exposure <- datraw$exposure/ 365
+
+
+#modification for glm test
+datraw$carGroup <- as.factor(datraw$carGroup)
+datraw$material <- as.factor(datraw$material)
+```
+
+
+Claim number and claim value according to different indicators in the train data
+```{r}
+grid.arrange(
+ggplot(datraw, aes(x = carType, claimNumber)) + 
+  geom_col( col = '#6633CC') ,
+ggplot(datraw, aes(carType, claimValue)) +
+  geom_col(col = '#33CCCC'),
+
+ggplot(datraw, aes(x = occupation, claimNumber)) + 
+  geom_col( col = '#6633CC') ,
+ggplot(datraw, aes(occupation, claimValue)) +
+  geom_col(col = '#33CCCC'),
+
+ggplot(datraw, aes(x = carCategory, claimNumber)) + 
+  geom_col( col = '#6633CC') ,
+ggplot(datraw, aes(carCategory, claimValue)) +
+  geom_col(col = '#33CCCC'),
+
+ggplot(datraw, aes(x = carGroup, claimNumber)) + 
+  geom_col( col = '#6633CC') ,
+ggplot(datraw, aes(carGroup, claimValue)) +
+  geom_col(col = '#33CCCC'),
+
+ggplot(datraw, aes(x = age, claimNumber)) + 
+  geom_col( col = '#6633CC') ,
+ggplot(datraw, aes(age, claimValue)) +
+  geom_col(col = '#33CCCC'),
+
+ncol = 2,
+nrow = 5
+)
+```
+
+
+```{r}
+plot(datraw$age)
+```
+
+```{r}
+boxplot(datraw$claimNumber~datraw$age,outline=FALSE, xlab = "age", ylab = "occurence of sinistre")
+```
+
+
+```{r}
+ggplot(datraw) +
+ aes(x = claimValue) +
+ geom_histogram(bins = 15L, fill = "#990000") +
+ theme_minimal() +
+ facet_wrap(vars(gender))
+
+```
+
+
+```{r}
+datraw %>%
+  group_by(gender) %>%
+  summarise(claimV= sum(claimValue)) %>%
+  mutate(per_clv=claimV/sum(claimV)) %>%
+  ggplot(aes(x="", y= claimV, 
+             fill=reorder(gender, claimV))) +
+            geom_col() + geom_text(aes(label = scales::percent(round(per_clv,2))), 
+            position = position_stack(vjust = 0.5))+
+  coord_polar(theta = "y")
+```
+
+
+```{r}
+train %>%
+  group_by(occupation) %>%
+  summarise(claimN= sum(claimNumber)) %>%
+  mutate(per_cl=claimN/sum(claimN)) %>%
+  ggplot(aes(x="", y= claimN, 
+             fill=reorder(occupation, claimN))) +
+            geom_col() + geom_text(aes(label = scales::percent(round(per_cl,2))), 
+            position = position_stack(vjust = 0.5))+
+  coord_polar(theta = "y")
+```
+
+
+```{r}
+features <- c("gender","carType","carCategory","occupation","age","carGroup", "bonus","carValue","material","region","cityDensity")
+```
+
+Modeling frequency of claim.
+Because the boosting technique is going to be used, the optimization of hyperparameters is necessary.
+
+1. Optimizing number of nround with a fixed value of learning rate = 0.1. It is observed that the optimal number of repeat is around 65.
+```{r}
+#MODELLING FREQUENCY DATA
+
+newdata_freq <- prepro(datraw)[features]
+
+dbX_freq <- as(as.matrix(newdata_freq),"dgCMatrix")
+dbY_freq <- as.numeric(datraw$claimNumber)
+
+dbTrain <- xgb.DMatrix(data = dbX_freq, label = dbY_freq, weight = as.numeric(datraw$exposure))
+
+
+xgb_params_freq <- list(booster = "gbtree", objective = "count:poisson",
+                   eta=0.1, gamma=0, max_depth=10,min_child_weight=1, 
+                   subsample=1,colsample_bytree=1,
+                   lambda = 0, alpha = 0,
+                   eval_metric = "rmse")
+
+xgbcv_freq <- xgb.cv( params = xgb_params_freq, data = dbTrain, metrics = "rmse",
+                 nrounds = 400, nfold = 5, nthread=7, verbose = FALSE)
+print(xgbcv_freq)
+
+grid.arrange(
+plot( xgbcv_freq$evaluation_log$iter ,xgbcv_freq$evaluation_log$test_rmse_mean),
+
+#zoom in
+plot( xgbcv_freq$evaluation_log$iter[50:200] ,xgbcv_freq$evaluation_log$test_rmse_mean[50:200]),
+plot( xgbcv_freq$evaluation_log$iter[100:150] ,xgbcv_freq$evaluation_log$test_rmse_mean[100:150]),
+
+ncol = 3
+
+)
+```
+
+2. Find the optimal nrounds value for different learning rate. Once again, if we use learning rate of 0.1, it is necessary to use nrounds value around 65
+
+```{r }
+## etas
+etas <- 1:10/100
+## params
+
+## Corresponding nrounds
+iters <- sapply(1:length(etas), function(ee){
+  paramsTemp <- xgb_params_freq
+  paramsTemp$eta <- etas[ee]
+  xgbcv <- xgb.cv(params = paramsTemp, data = dbTrain, metrics = "rmse",
+                  nrounds = 200, nfold = 5, nthread=7, verbose = FALSE)
+  iter <- as.numeric(xgbcv$evaluation_log[which.min(xgbcv$evaluation_log$test_rmse_mean), "iter"][1])
+  return(iter)
+})
+plot(etas,iters)
+```
+
+3. Tuning for max_depth parameters, the higher max_depth is, the higher chance of overfitting. For the model of frequency, we choose the max_depth value as 5.
+
+```{r}
+
+##Tunning Max depth
+depth <- c(1:10)
+iters_sev <- sapply(1:length(depth), function(ee){
+  paramsTemp <- xgb_params_freq
+  paramsTemp$max_depth <- depth[ee]
+  xgbcv <- xgb.cv(params = paramsTemp, data = dbTrain, metrics = "rmse",
+                  nrounds = 120, nfold = 5, nthread=7, verbose = FALSE)
+  rmse <- as.numeric(xgbcv$evaluation_log$test_rmse_mean[which.min(xgbcv$evaluation_log$test_rmse_mean)])
+  return(rmse)
+})
+plot(depth,iters_sev)
+
+```
+
+Compare different approachs for modeling frequency of claims including: GLM, CART, BOOSTING. The tuning of hyperparameters of model CART is just changing the hyperparameter cp - the minimum improvement that a split required to have.
+
+```{r}
+#_______________________________
+#Model Comparison
+#____________________________
+params_freq <- list(booster = "gbtree", objective = "count:poisson",
+               eta=0.1, gamma=0, max_depth = 5 ,min_child_weight=1, 
+               subsample=1,colsample_bytree=1,
+               lambda = 0, alpha = 0,
+               eval_metric = "rmse")
+
+
+error <- lapply(1:nfold, function(kk){
+  ## Train set
+  
+  
+  train <- datraw[which(datraw$fold != paste0("data", kk)),]
+  
+  
+  xgtrain <- prepro(train)[features]
+  
+  dbX <- as(as.matrix(xgtrain),"dgCMatrix")
+  dbY <- as.numeric(train$freq)
+  
+  dbTrain <- xgb.DMatrix(data = dbX, label = dbY, weight = as.numeric(train$exposure))
+  
+  #CART
+  cart <- rpart(
+    formula = as.formula(paste('cbind(exposure, claimNumber) ~', paste(features, collapse = ' + '))),
+    data = train,
+    method = 'poisson',
+    parms = list(shrink = 0.125), # gamma in Table 3
+    control = rpart.control(cp = 0, # cp in Table 3
+                            minbucket = 5, # kappa in Table 1
+                            xval = 6)
+  )
+  
+  cp <- cart$cptable[which.min(cart$cptable[,4]),1]
+  cart <- prune(cart, cp = cp)
+  
+  #GLM 
+  reg <- glm(formula = as.formula(paste(' claimNumber ~ offset(log(exposure))+', paste(features, collapse = ' + '))),  family = poisson(), data = train)
+  
+  #XGBOOST
+  xgb <- xgb.train(params = params_freq, data = dbTrain, nrounds = 65,verbose = FALSE)
+  
+  
+  ## Test set
+  
+  test <- datraw[which(datraw$fold == paste0("data", kk)),]
+  
+  xgtrain <- prepro(test)[features]
+  
+  dbX <- as(as.matrix(xgtrain),"dgCMatrix")
+  dbY <- as.numeric(test$claimNumber)
+  dbTest <- xgb.DMatrix(data = dbX, label = dbY, weight = as.numeric(test$exposure))
+  
+  errorGBM <- sqrt(mean((predict(xgb,dbTest)-dbY)^2))
+  errorCART <- sqrt(mean((predict(cart, newdata=test)-test$claimNumber)^2))
+  errorGLM <- sqrt(mean((predict(reg, newdata=test)-test$claimNumber)^2))
+  
+  return(c(errorGBM, errorCART, errorGLM))
+})
+
+error <- as.data.frame(do.call("rbind",error))
+mean(error[,1])
+colnames(error) <- c("GBM","CART","GLM")
+
+plot_ly(error, type = 'box')%>%
+  add_trace(x=~GBM, name="GBM")%>%
+  add_trace(x=~CART, name="CART")%>%
+  add_trace(x=~GLM, name="GLM")%>%
+  layout(title = "Erreur de prediction",
+         xaxis = list(title = "RMSE"),
+         yaxis = list (title = "Modele"))
+
+```
+
+
+Modeling Severity of Claim.
+
+First, select just the data that contains claimValue > 0 to find the expected claim that one person when he file a claims could have. Claimvalue < 50 is considered as trivial, ClaimValue > 10000 is considered as too severe, not possible to model
+
+```{r}
+
+#MODELLING SEVERITY DATA
+
+#Claimvalue < 50 is considered as trivial, ClaimValue > 10000 is considered as too severe, not possible to model
+
+datclaim <- datraw %>% 
+  filter(claimValue > 50 & claimValue <= 10000) %>% 
+  mutate(average = claimValue/claimNumber)
+
+datclaim <- datclaim %>% mutate (fold = paste0("data", rep(1:nfold, length = nrow(datclaim)))) 
+
+
+```
+
+Visualize data for better understanding of distribution. We can see this bring a similar form of gamma distribution. So the objective function of xgboosting will be set as "reg:gamma" and the same apply for GLM. However, the CART model has not supported the gamma method yet, so the technique of "anova" is used instead.
+
+```{r}
+#Data visualization
+
+gridExtra::grid.arrange(
+  ggplot(datclaim, aes(x = average)) + 
+    geom_density(adjust = 3, col = 'black', fill = 'gray') +
+    labs(y = 'Density'),
+  ggplot(datclaim, aes(x = average)) + 
+    geom_density(adjust = 3, col = 'black', fill = 'gray') +
+    labs(y = 'Density') + xlim(0, 1e4),
+  ncol = 2
+)
+```
+
+The same tuning strategy could be applied for the model of predicting claim severity.
+Tuning of nround for a fixed value learning rate. For the learning rate of 0.1, the nrounds value optimal is around 120.
+```{r}
+#TUNING FOR XGBOOST_SEVERITY
+newdata <- prepro(datclaim)[features]
+dbX_sev <- as(as.matrix(newdata),"dgCMatrix")
+dbY_sev <- as.numeric(datclaim$claimValue)
+
+dbTrain_sev <- xgb.DMatrix(data = dbX_sev, label = dbY_sev,weight = as.numeric(datclaim$claimNumber))
+
+
+xgb_params_sev <- list(booster = "gbtree", objective = "reg:gamma",
+                        eta=0.1, gamma=0, max_depth=10,min_child_weight=1, 
+                        subsample=1,colsample_bytree=1,
+                        lambda = 0, alpha = 0,
+                        eval_metric = "rmse")
+
+xgbcv_sev <- xgb.cv( params = xgb_params_sev, data = dbTrain_sev, metrics = "rmse",
+                 nrounds = 400, nfold = 5, nthread=7, verbose = FALSE)
+
+attributes(xgbcv_sev)
+xgbcv_sev$evaluation_log
+```
+
+
+2. Find the optimal nrounds to each value of learning rate. 
+```{r}
+#tuning xgboost_sev
+## etas
+## params
+## Corresponding nrounds
+iters_sev <- sapply(1:length(etas), function(ee){
+  paramsTemp <- xgb_params_sev
+  paramsTemp$eta <- etas[ee]
+  xgbcv <- xgb.cv(params = paramsTemp, data = dbTrain_sev, metrics = "rmse",
+                  nrounds = 400, nfold = 5, nthread=7, verbose = FALSE)
+  iter <- as.numeric(xgbcv$evaluation_log[which.min(xgbcv$evaluation_log$test_rmse_mean), "iter"][1])
+  return(iter)
+})
+plot(etas,iters_sev)
+```
+
+
+Tuning the same max_depth as frequency model. We choose the max_depth value which is best for the 2 hyperparameters already selected (nrounds and learning rate eta) as 2.
+```{r}
+##Tunning Max depth
+depth <- c(1:10)
+iters_sev <- sapply(1:length(depth), function(ee){
+  paramsTemp <- xgb_params_sev
+  paramsTemp$max_depth <- depth[ee]
+  xgbcv <- xgb.cv(params = paramsTemp, data = dbTrain_sev, metrics = "rmse",
+                  nrounds = 120, nfold = 5, nthread=7, verbose = FALSE)
+  rmse <- as.numeric(xgbcv$evaluation_log$test_rmse_mean[which.min(xgbcv$evaluation_log$test_rmse_mean)])
+  return(rmse)
+})
+plot(depth,iters_sev)
+```
+
+
+Comparing differents technique for regression of claim severity.
+
+Despite the fact that mse is not a good metric for estimating the performance of a model when the data is right skew (we can use deviance instead), For the sake of systhronizing the metric of evaluation, the mse is selected to compare between these models.
+
+```{r}
+params_sev <- list(booster = "gbtree", objective = "reg:gamma",
+                    eta=0.1, gamma=0, max_depth=2,min_child_weight=1, 
+                    subsample=1,colsample_bytree=1,
+                    lambda = 0, alpha = 0,
+                    eval_metric = "rmse")
+
+
+error <- lapply(1:nfold, function(kk){
+  ## Train set
+  
+  
+  train <- datclaim[which(datclaim$fold != paste0("data", kk)),]
+  xgtrain <- train
+  xgtrain <- prepro(xgtrain)
+  xgtrain <- xgtrain[features]
+  dbX <- as(as.matrix(xgtrain), "dgCMatrix")
+  dbY <- as.numeric(train$average)
+  
+  dbTrain <- xgb.DMatrix(data = dbX, label = dbY)
+  
+  #CART
+  cart <- rpart(
+    formula = as.formula(paste('average ~', paste(features, collapse = ' + '))),
+    data = train,
+    method = 'anova',
+    parms = list(shrink = 0.125), 
+    control = rpart.control(cp = 0, 
+                            minbucket = 5,
+                            xval = 6)
+  )
+  
+  cp <- cart$cptable[which.min(cart$cptable[,4]),1]
+  cart <- prune(cart, cp = cp)
+  
+  #GLM 
+  reg <- glm(formula = as.formula(paste(' average ~ ', paste(features, collapse = ' + '))),  family = Gamma(link = "log"), data = train)
+  
+  #XGBOOST
+  xgb <- xgb.train(params = params_sev, data = dbTrain, nrounds = 120,verbose = FALSE)
+  ## Test set
+  
+  test <- datclaim[which(datclaim$fold == paste0("data", kk)),]
+  xgtest <- test
+  xgtest <- prepro(xgtest)
+  xgtest <- xgtest[features]
+  dbX <- as(as.matrix(xgtest),"dgCMatrix")
+  dbY <- as.numeric(test$average)
+  dbTest <- xgb.DMatrix(data = dbX, label = dbY)
+  
+  errorGBM <- sqrt(mean((predict(xgb,dbTest)-dbY)^2))
+  errorCART <- sqrt(mean((predict(cart, newdata=test)-test$claimValue)^2))
+  errorGLM <- sqrt(mean((predict(reg, newdata=test)-test$claimValue)^2))
+  
+  return(c(errorGBM, errorCART, errorGLM))
+})
+error
+error <- as.data.frame(do.call("rbind",error))
+
+
+colnames(error) <- c("GBM","CART","GLM")
+
+
+plot_ly(error, type = 'box')%>%
+  add_trace(x=~GBM, name="GBM")%>%
+  add_trace(x=~CART, name="CART")%>%
+  add_trace(x=~GLM, name="GLM")%>%
+  layout(title = "Erreur de prediction",
+         xaxis = list(title = "RMSE"),
+         yaxis = list (title = "Modele"))
+
+```
+
+According to the testing result between different methods, both frequency and severity are going to be modeled by the technique of boosting.
+
+Training result of frequency.
+```{r}
+newdata <- prepro(datraw)
+newdata <- newdata[features]
+
+dbX_freq <- as(as.matrix(newdata),"dgCMatrix")
+dbY_freq <- as.numeric(datraw$claimNumber)
+
+dbTrain <- xgb.DMatrix(data = dbX_freq, label = dbY_freq, weight = as.numeric(datraw$exposure))
+xgb_params_freq <- list(booster = "gbtree", objective = "count:poisson",
+                        eta=0.1, gamma=0, max_depth=5,min_child_weight=1, 
+                        subsample = 1,colsample_bytree=1,
+                        lambda = 0, alpha = 0,
+                        eval_metric = "rmse")
+
+xgb_freq <- xgb.train( params = xgb_params_freq, data = dbTrain,
+                      nrounds = 65, nthread= 7, verbose = FALSE)
+hist(predict(xgb_freq, dbTrain, type = "response"))
+hist(datclaim$claimNumber)
+
+```
+
+
+Training result of severity.
+```{r}
+newdata_sev <- prepro(datclaim)
+newdata_sev <- newdata_sev[features]
+
+dbX_sev <- as(as.matrix(newdata_sev),"dgCMatrix")
+dbY_sev <- as.numeric(datclaim$average)
+
+dbTrain_sev <- xgb.DMatrix(data = dbX_sev, label = dbY_sev)
+
+xgb_params_sev <- list(booster = "gbtree", objective = "reg:gamma",
+                       eta=0.1, gamma=0, max_depth= 2,min_child_weight=1, 
+                       subsample=1,colsample_bytree=1,
+                       lambda = 0, alpha = 0,
+                       eval_metric = "logloss")
+
+xgb_sev <- xgb.train( params = xgb_params_sev, data = dbTrain_sev,
+                     nrounds = 110, nthread=7, verbose = FALSE)
+
+
+hist(predict(xgb_sev, dbTrain_sev, type = "response"))
+hist(datclaim$average)
+```
+
+
+3. Intepretation
+
+3.1 For the frequency
+
+Variables Importance
+```{r}
+
+importance_matrix <- xgb.importance(features, model = xgb_freq)
+xgb.plot.importance(importance_matrix, col ='black')
+```
+
+Partial Dependency of Different variables
+```{r}
+partial(xgb_freq, pred.var = "age",train = dbX_freq,type = "regression",plot = TRUE)
+partial(xgb_freq, pred.var = "bonus",train = dbX_freq,type = "regression",plot = TRUE)
+
+```
+
+
+Shap Value summay
+```{r}
+xgb.plot.shap.summary(data=dbX_freq ,model=xgb_freq)
+
+```
+
+
+3.1 For the severity
+
+Variables Importance
+```{r}
+
+importance_matrix <- xgb.importance(features, model = xgb_sev)
+xgb.plot.importance(importance_matrix, col ='black')
+```
+
+Partial Dependency of Different variables
+```{r}
+partial(xgb_sev, pred.var = "bonus",train = dbX_freq,type = "regression",plot = TRUE)
+
+```
+
+
+Shap Value summay
+```{r}
+xgb.plot.shap.summary(data=dbX_freq ,model=xgb_sev)
+
+```
+
+
+```{r}
+summary(testraw)
+
+
+newdata_test <- prepro(testraw)
+newdata_test <- newdata_test[features]
+dbX_test <- as(as.matrix(newdata_test),"dgCMatrix")
+dbtest <- xgb.DMatrix(data = dbX_test)
+
+
+
+predicted_freq <- as.vector(predict(xgb_freq, dbtest))
+predicted_sev <- predict(xgb_sev, dbtest)
+
+
+hist(predicted_freq)
+hist(predicted_sev)
+
+testraw1 <- testraw %>% 
+  mutate( freq = predict(xgb_freq, dbtest) ) %>% 
+  mutate(sev = predict(xgb_sev, dbtest)) %>%
+  mutate(prem = freq*sev)
+
+testraw1
+fold <- paste(getwd(),"/",sep="")
+write.csv(testraw1,paste(fold,"premium_n.csv",sep=""))
+
+```
+
